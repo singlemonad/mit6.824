@@ -99,9 +99,11 @@ func (cfg *config) crash1(i int) {
 	}
 
 	if cfg.saved[i] != nil {
-		raftlog := cfg.saved[i].ReadRaftState()
+		raftState := cfg.saved[i].ReadRaftState()
+		raftLog := cfg.saved[i].ReadSnapshot()
 		cfg.saved[i] = &Persister{}
-		cfg.saved[i].SaveRaftState(raftlog)
+		cfg.saved[i].SaveRaftState(raftState)
+		cfg.saved[i].SaveSnapshot(raftLog)
 	}
 }
 
@@ -266,7 +268,9 @@ func (cfg *config) checkOneLeader() int {
 		leaders := make(map[int][]int)
 		for i := 0; i < cfg.n; i++ {
 			if cfg.connected[i] {
-				if t, leader := cfg.rafts[i].GetState(); leader {
+				t, leader := cfg.rafts[i].GetState()
+				//fmt.Printf("checkOneLeader id = %d, term = %d, isLeader = %v\n", i, t, leader)
+				if leader {
 					leaders[t] = append(leaders[t], i)
 				}
 			}
@@ -332,6 +336,7 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 		cfg.mu.Unlock()
 
 		if ok {
+			//fmt.Printf("4444444\n")
 			if count > 0 && cmd != cmd1 {
 				cfg.t.Fatalf("committed values do not match: index %v, %v, %v\n",
 					index, cmd, cmd1)
@@ -405,12 +410,15 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 			}
 		}
 
+		//fmt.Printf("222222 index=%d\n", index)
+
 		if index != -1 {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
-			for time.Since(t1).Seconds() < 2 {
+			for time.Since(t1).Seconds() < 3 {
 				nd, cmd1 := cfg.nCommitted(index)
+				//fmt.Printf("333333 nd=%d, cmd1=%v\n", nd, cmd1)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
