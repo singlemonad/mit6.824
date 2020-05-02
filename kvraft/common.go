@@ -10,6 +10,7 @@ type Err string
 // Put or Append
 type PutAppendArgs struct {
 	// You'll have to add definitions here.
+	Uuid  string
 	Key   string
 	Value string
 	Op    string // "Put" or "Append"

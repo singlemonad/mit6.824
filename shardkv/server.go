@@ -1,13 +1,13 @@
 package shardkv
 
-
 // import "shardmaster"
-import "labrpc"
-import "raft"
-import "sync"
-import "encoding/gob"
+import (
+	"encoding/gob"
+	"sync"
 
-
+	"github.com/singlemonad/mit6.824/labrpc"
+	"github.com/singlemonad/mit6.824/raft"
+)
 
 type Op struct {
 	// Your definitions here.
@@ -15,6 +15,7 @@ type Op struct {
 	// otherwise RPC will break.
 }
 
+// represent a raft group
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
@@ -27,7 +28,6 @@ type ShardKV struct {
 
 	// Your definitions here.
 }
-
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
@@ -47,7 +47,6 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 }
-
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -96,7 +95,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
 
 	return kv
 }

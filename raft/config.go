@@ -11,6 +11,7 @@ package raft
 import (
 	crand "crypto/rand"
 	"encoding/base64"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"runtime"
@@ -21,6 +22,17 @@ import (
 
 	"github.com/singlemonad/mit6.824/labrpc"
 )
+
+func MaterInt(encoder *gob.Encoder, command interface{}) error {
+	val := command.(int)
+	return encoder.Encode(val)
+}
+
+func DeMaterInt(decoder *gob.Decoder) (interface{}, error) {
+	var command int
+	err := decoder.Decode(&command)
+	return command, err
+}
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -181,7 +193,7 @@ func (cfg *config) start1(i int) {
 		}
 	}()
 
-	rf := Make(ends, i, cfg.saved[i], applyCh)
+	rf := Make(ends, i, cfg.saved[i], applyCh, MaterInt, DeMaterInt)
 
 	cfg.mu.Lock()
 	cfg.rafts[i] = rf

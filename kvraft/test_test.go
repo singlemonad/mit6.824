@@ -1,13 +1,15 @@
 package raftkv
 
-import "testing"
-import "strconv"
-import "time"
-import "fmt"
-import "math/rand"
-import "log"
-import "strings"
-import "sync/atomic"
+import (
+	"fmt"
+	"log"
+	"math/rand"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -129,9 +131,11 @@ func partitioner(t *testing.T, cfg *config, ch chan bool, done *int32) {
 // maxraftstate is a positive number, the size of the state for Raft (i.e., log
 // size) shouldn't exceed 2*maxraftstate.
 func GenericTest(t *testing.T, tag string, nclients int, unreliable bool, crash bool, partitions bool, maxraftstate int) {
-	const nservers = 5
+	const nservers = 3
 	cfg := make_config(t, tag, nservers, unreliable, maxraftstate)
 	defer cfg.cleanup()
+
+	time.Sleep(time.Second * 3)
 
 	ck := cfg.makeClient(cfg.All())
 
@@ -143,7 +147,7 @@ func GenericTest(t *testing.T, tag string, nclients int, unreliable bool, crash 
 		clnts[i] = make(chan int)
 	}
 	for i := 0; i < 3; i++ {
-		// log.Printf("Iteration %v\n", i)
+		//log.Printf("Iteration %v\n", i)
 		atomic.StoreInt32(&done_clients, 0)
 		atomic.StoreInt32(&done_partitioner, 0)
 		go spawn_clients_and_wait(t, cfg, nclients, func(cli int, myck *Clerk, t *testing.T) {
@@ -157,12 +161,12 @@ func GenericTest(t *testing.T, tag string, nclients int, unreliable bool, crash 
 			for atomic.LoadInt32(&done_clients) == 0 {
 				if (rand.Int() % 1000) < 500 {
 					nv := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
-					// log.Printf("%d: client new append %v\n", cli, nv)
+					//log.Printf("%d: client new append %v\n", cli, nv)
 					myck.Append(key, nv)
 					last = NextValue(last, nv)
 					j++
 				} else {
-					// log.Printf("%d: client new get %v\n", cli, key)
+					//log.Printf("%d: client new get %v\n", cli, key)
 					v := myck.Get(key)
 					if v != last {
 						log.Fatalf("get wrong value, key %v, wanted:\n%v\n, got\n%v\n", key, last, v)
@@ -354,7 +358,7 @@ func TestOnePartition(t *testing.T) {
 	default:
 	}
 
-	check(t, ck, "1", "15")
+	check(t, ck, "1", "16")
 
 	fmt.Printf("  ... Passed\n")
 }

@@ -66,20 +66,22 @@ type Raft struct {
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	logger    *zap.SugaredLogger
-	role      Role
-	term      int
-	voteFor   int
-	leader    int
-	commit    int
-	applied   int
-	stepFunc  stepFunc
-	raftLog   RaftLog
-	nodeTotal int
-	applyC    chan ApplyMsg
-	loopC     chan *RequestHandle
-	exitC     chan interface{}
-	wg        sync.WaitGroup
+	logger      *zap.SugaredLogger
+	role        Role
+	term        int
+	voteFor     int
+	leader      int
+	commit      int
+	applied     int
+	persisted   int // 已经应用到状态机并持久化的最大log索引
+	timeoutBase int
+	stepFunc    stepFunc
+	raftLog     RaftLog
+	nodeTotal   int
+	applyC      chan ApplyMsg
+	loopC       chan *RequestHandle
+	exitC       chan interface{}
+	wg          sync.WaitGroup
 
 	electionTimeout        int
 	electionTimeoutCounter int
@@ -89,6 +91,9 @@ type Raft struct {
 	matchIndexs []int
 
 	trustFollower map[int]bool // 日志和Leader保持一致的Follower
+
+	lastIncludeIndex int
+	lastIncludeTerm  int
 }
 
 //
@@ -103,7 +108,7 @@ type Raft struct {
 // for any long-running work.
 //
 func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	persister *Persister, applyCh chan ApplyMsg, materFunc MaterializeFunc, deMaterFunc DeMaterializeFunc) *Raft {
 	logger, _ := zap.NewProduction()
 	rf := &Raft{
 		mu:                     sync.Mutex{},
@@ -117,21 +122,39 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		leader:                 -1,
 		commit:                 -1,
 		applied:                -1,
+		persisted:              -1,
+		lastIncludeIndex:       -1,
+		lastIncludeTerm:        -1,
+		timeoutBase:            50,
 		nodeTotal:              len(peers),
 		applyC:                 applyCh,
 		loopC:                  make(chan *RequestHandle, 10000),
 		exitC:                  make(chan interface{}),
 		wg:                     sync.WaitGroup{},
-		electionTimeout:        10 + int(rand.NewSource(time.Now().UnixNano()).Int63()%int64(20)),
 		electionTimeoutCounter: 0,
 	}
+	rf.electionTimeout = timeoutRand(rf.timeoutBase)
 	rf.stepFunc = rf.electionTimeoutMonitor
 
-	/// initialize from state persisted before a crash
-	//	r initialize from state persisted before a crash
-	rf.readPersist(rf.persister.ReadRaftState())
-
-	//rf.logger.Infow("raft node state", "me", rf.me, "term", rf.term, "vote", rf.voteFor, "applied", rf.applied, "logs", rf.raftLog.GetLogs(0))
+	// initialize from state persisted before a crash than apply log
+	rf.readPersist(rf.persister.ReadRaftState(), materFunc, deMaterFunc)
+	if rf.persister.ReadSnapshot() != nil {
+		rf.applyC <- ApplyMsg{
+			Index:       0,
+			Command:     nil,
+			UseSnapshot: true,
+			Snapshot:    rf.persister.ReadSnapshot(),
+		}
+	}
+	for index := rf.persisted + 1; index <= rf.commit; index++ {
+		rf.applyC <- ApplyMsg{
+			Index:       index,
+			Command:     rf.raftLog.GetLog(index).Data,
+			UseSnapshot: false,
+			Snapshot:    nil,
+		}
+		rf.applied++
+	}
 
 	rf.wg.Add(1)
 	go rf.mainLoop()
@@ -139,13 +162,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
+func timeoutRand(base int) int {
+	return base + int(rand.NewSource(time.Now().UnixNano()).Int63()%int64(base))
+}
+
 type RequestType = int
 
 const (
-	RequestVote   = 1
-	AppendEntries = 2
-	GetStates     = 3
-	Propose       = 4
+	RequestVote     = 1
+	AppendEntries   = 2
+	GetStates       = 3
+	Propose         = 4
+	GetRaftStates   = 5
+	Snapshot        = 6
+	RaftLogOversize = 7
 )
 
 type RequestHandle struct {
@@ -227,6 +257,54 @@ func (rf *Raft) GetState() (int, bool) {
 	return reply.term, reply.isLeader
 }
 
+type GetRaftStateArgs struct {
+}
+
+type GetRaftStateReply struct {
+	RaftStateSize int
+}
+
+func (rf *Raft) GetRaftSate() int {
+	reply := &GetRaftStateReply{}
+	h := makeRequestHandle(GetRaftStates, nil, reply)
+	rf.loopC <- h
+	<-h.resultCh
+	return reply.RaftStateSize
+}
+
+type SnapshotArgs struct {
+	Id               int
+	Term             int
+	LeaderId         int
+	LastIncludeIndex int
+	LastIncludeTerm  int
+	Offset           int
+	Data             []byte
+	Done             bool
+}
+
+type SnapshotReply struct {
+	Term   int
+	Reject bool
+}
+
+func (rf *Raft) Snapshot(args SnapshotArgs, reply *SnapshotReply) {
+	h := makeRequestHandle(Snapshot, args, reply)
+	rf.loopC <- h
+	<-h.resultCh
+}
+
+type RaftLogOversizeArgs struct {
+	LastAppliedIndex int
+	Data             []byte
+}
+
+func (rf *Raft) RaftLogOversize(data []byte) {
+	h := makeRequestHandle(RaftLogOversize, RaftLogOversizeArgs{rf.applied, data}, nil)
+	rf.loopC <- h
+	<-h.resultCh
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -277,9 +355,9 @@ func (rf *Raft) mainLoop() {
 		//rf.logger.Infow("main loop exit", "id", rf.me)
 	}()
 
-	//rf.logger.Infow("raft start", "md", rf.me)
+	rf.logger.Infow("raft start", "md", rf.me, "term", rf.term, "applied", rf.applied)
 
-	stepTicker := time.NewTicker(time.Millisecond * 100)
+	stepTicker := time.NewTicker(time.Millisecond * 10)
 	applyTicker := time.NewTicker(time.Millisecond * 10)
 	syncFollowerTicker := time.NewTicker(time.Millisecond * 200)
 	for {
@@ -292,7 +370,6 @@ func (rf *Raft) mainLoop() {
 			if rf.isLeader() {
 				rf.syncFollower()
 			}
-			//rf.logger.Infow("I'm Live", "me", rf.me, "role", rf.role)
 		case req := <-rf.loopC:
 			switch req.typ {
 			case RequestVote:
@@ -303,6 +380,12 @@ func (rf *Raft) mainLoop() {
 				rf.getState(req)
 			case Propose:
 				rf.propose(req)
+			case GetRaftStates:
+				rf.getRaftState(req)
+			case Snapshot:
+				rf.snapshot(req)
+			case RaftLogOversize:
+				rf.raftLogOversize(req)
 			}
 		case <-rf.exitC:
 			return
@@ -334,7 +417,7 @@ func (rf *Raft) requestVote(req *RequestHandle) {
 		rf.electionTimeoutCounter = 0
 		rf.becomeFollower(args.Term, -1)
 	} else {
-		rf.logger.Infow("reject vote", "me", rf.me, "term", rf.term, "vote", rf.voteFor, "args", args, "lastIndex", rf.raftLog.LastIndex(), "lastTerm", rf.raftLog.LastTerm())
+		//rf.logger.Infow("reject vote", "me", rf.me, "term", rf.term, "vote", rf.voteFor, "args", args, "lastIndex", rf.raftLog.LastIndex(), "lastTerm", rf.raftLog.LastTerm())
 
 		reply.Reject = true
 	}
@@ -348,6 +431,8 @@ func (rf *Raft) appendEntries(req *RequestHandle) {
 	reply := req.reply.(*AppendEntriesReply)
 
 	if args.Term < rf.term {
+		//rf.logger.Infow("receive AppendEntries", "me", rf.me, "term", rf.term, "args", args)
+
 		reply.Term = rf.term
 		reply.Reject = true
 		req.resultCh <- struct{}{}
@@ -378,7 +463,7 @@ func (rf *Raft) appendEntries(req *RequestHandle) {
 		return
 	}
 
-	rf.logger.Infow("receive AppendEntries", "me", rf.me, "term", rf.term, "args", args)
+	//rf.logger.Infow("receive AppendEntries", "me", rf.me, "term", rf.term, "args", args)
 
 	if rf.raftLog.Match(args.PreLogIndex, args.PreLogTerm) {
 		rf.raftLog.Catoff(args.PreLogIndex + 1)
@@ -389,7 +474,7 @@ func (rf *Raft) appendEntries(req *RequestHandle) {
 			rf.commit = applyIndex
 		}
 	} else {
-		rf.logger.Infow("AppendEntries not match", "me", rf.me, "term", rf.term, "my term", rf.raftLog.GetLogTerm(args.PreLogIndex), "leader term", args.PreLogTerm)
+		//rf.logger.Infow("AppendEntries not match", "me", rf.me, "term", rf.term, "my term", rf.raftLog.GetLogTerm(args.PreLogIndex), "leader term", args.PreLogTerm)
 
 		reply.MatchIndex = rf.raftLog.GetMaxMatchIndex(args.PreLogTerm)
 		if reply.MatchIndex == -1 {
@@ -427,7 +512,7 @@ func (rf *Raft) propose(req *RequestHandle) {
 
 	//rf.logger.Infow("propose", "me", rf.me, "term", rf.term, "data", args.command)
 
-	rf.raftLog.Append([]*Entry{&Entry{rf.term, args.command}})
+	rf.raftLog.Append([]*Entry{&Entry{rf.raftLog.LastIndex() + 1, rf.term, args.command}})
 	rf.nextIndexs[rf.me] = rf.raftLog.LastIndex() + 1
 	rf.matchIndexs[rf.me] = rf.raftLog.LastIndex()
 	rf.persist()
@@ -447,6 +532,8 @@ func (rf *Raft) propose(req *RequestHandle) {
 			Entries:     rf.raftLog.GetLogs(rf.nextIndexs[id]),
 		}, appendReply)
 
+		//rf.logger.Infow("receive AppendEntries reply", "args", args, "reply", reply)
+
 		if succeed {
 			if !rf.appendEntriesReply(appendReply, id) {
 				reply.term = -1
@@ -464,6 +551,55 @@ func (rf *Raft) propose(req *RequestHandle) {
 	req.resultCh <- struct{}{}
 
 	return
+}
+
+func (rf *Raft) getRaftState(req *RequestHandle) {
+	reply := req.reply.(*GetRaftStateReply)
+	reply.RaftStateSize = rf.persister.RaftStateSize()
+	req.resultCh <- struct{}{}
+}
+
+func (rf *Raft) raftLogOversize(req *RequestHandle) {
+	args := req.args.(RaftLogOversizeArgs)
+
+	rf.persister.SaveSnapshot(args.Data)
+	rf.persisted = args.LastAppliedIndex
+	rf.lastIncludeIndex = args.LastAppliedIndex
+	rf.lastIncludeTerm = rf.raftLog.GetLogTerm(args.LastAppliedIndex)
+	rf.persist()
+	rf.raftLog.RemoveExpiredLogs(args.LastAppliedIndex)
+	req.resultCh <- struct{}{}
+}
+
+func (rf *Raft) snapshot(req *RequestHandle) {
+	args := req.args.(SnapshotArgs)
+	reply := req.args.(*SnapshotReply)
+
+	if args.Term < rf.term {
+		reply.Term = rf.term
+		reply.Reject = true
+		req.resultCh <- struct{}{}
+		return
+	}
+
+	if args.Term > rf.term {
+		rf.electionTimeoutCounter = 0
+		rf.electionTimeout = timeoutRand(rf.timeoutBase)
+		rf.becomeFollower(args.Term, args.LeaderId)
+	}
+
+	if rf.raftLog.Match(args.LastIncludeIndex, args.LastIncludeTerm) && args.Done {
+		rf.persister.SaveSnapshot(args.Data)
+		rf.persisted = args.LastIncludeIndex
+		rf.persist()
+		rf.raftLog.RemoveExpiredLogs(args.LastIncludeIndex)
+	} else {
+		rf.logger.Infow("reject SnapshotRequest", "me", rf.me, "term", rf.term, "index", args.LastIncludeIndex, "index term", rf.raftLog.GetLogTerm(args.LastIncludeIndex), "args", args)
+
+		reply.Reject = true
+	}
+	reply.Term = rf.term
+	req.resultCh <- struct{}{}
 }
 
 func (rf *Raft) appendEntriesReply(reply *AppendEntriesReply, id int) bool {
@@ -522,7 +658,7 @@ func (rf *Raft) applyCommand() {
 		rf.applied++
 		rf.persist()
 
-		rf.logger.Infow("apply log", "me", rf.me, "term", rf.term, "log", msg)
+		//rf.logger.Infow("apply log", "me", rf.me, "term", rf.term, "log", msg)
 	}
 }
 
@@ -532,7 +668,27 @@ func (rf *Raft) syncFollower() {
 			continue
 		}
 
-		if rf.nextIndexs[id] <= rf.raftLog.LastIndex() {
+		nextIndex := rf.nextIndexs[id]
+		if nextIndex < rf.raftLog.FirstIndex() {
+			// leader日志已被清理，发送snapshot
+			reply := &SnapshotReply{}
+			args := SnapshotArgs{
+				Id:               rf.me,
+				Term:             rf.term,
+				LeaderId:         rf.leader,
+				LastIncludeIndex: rf.lastIncludeIndex,
+				LastIncludeTerm:  rf.lastIncludeTerm,
+				Offset:           0,
+				Data:             rf.persister.ReadSnapshot(),
+				Done:             true,
+			}
+			succeed := rf.sendSnapshot(id, args, reply)
+			if succeed {
+				if !rf.snapshotReply(reply, id) {
+					return
+				}
+			}
+		} else if rf.nextIndexs[id] <= rf.raftLog.LastIndex() {
 			reply := &AppendEntriesReply{}
 			succeed := rf.sendAppendEntries(id, AppendEntriesArgs{
 				Id:          rf.me,
@@ -544,9 +700,29 @@ func (rf *Raft) syncFollower() {
 			}, reply)
 
 			if succeed {
-				rf.appendEntriesReply(reply, id)
+				if !rf.appendEntriesReply(reply, id) {
+					return
+				}
 			}
 		}
+	}
+}
+
+func (rf *Raft) snapshotReply(reply *SnapshotReply, id int) bool {
+	if reply.Term > rf.term {
+		rf.becomeFollower(reply.Term, -1)
+		return false
+	}
+
+	if reply.Reject {
+		// do nothing
+		return false
+	} else {
+		rf.nextIndexs[id] = rf.lastIncludeIndex + 1
+		rf.matchIndexs[id] = rf.lastIncludeIndex
+		rf.updateCommit()
+		rf.trustFollower[id] = true
+		return true
 	}
 }
 
@@ -566,7 +742,6 @@ func (rf *Raft) electionTimeoutMonitor() {
 func (rf *Raft) startElection() {
 	rf.logger.Infow("start election", "me", rf.me, "term", rf.term)
 
-	beLeader := false
 	for id, _ := range rf.peers {
 		if id == rf.me {
 			continue
@@ -598,16 +773,14 @@ func (rf *Raft) startElection() {
 				if rf.voteHadGot >= rf.nodeTotal/2+1 {
 					rf.electionTimeoutCounter = 0
 					rf.becomeLeader()
-					beLeader = true
 					return
 				}
 			}
 		}
 	}
-	if !beLeader {
-		rf.electionTimeoutCounter = 0
-		rf.electionTimeout = 10 + int(rand.NewSource(time.Now().UnixNano()).Int63()%int64(20))
-	}
+
+	rf.electionTimeoutCounter = 0
+	rf.electionTimeout = timeoutRand(rf.timeoutBase)
 }
 
 func (rf *Raft) becomeLeader() {
@@ -642,7 +815,7 @@ func (rf *Raft) becomeCandidate() {
 
 func (rf *Raft) becomeFollower(term, leader int) {
 	if rf.role != Follower {
-		rf.logger.Infow("become follower", "me", rf.me, "term", rf.term, "pre role", rf.role)
+		rf.logger.Infow("become follower", "me", rf.me, "term", rf.term, "new term", term, "leader", leader, "pre role", rf.role)
 	}
 
 	rf.role = Follower
@@ -697,7 +870,7 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 	select {
 	case ok := <-finishC:
 		return ok
-	case <-time.After(time.Millisecond * 30):
+	case <-time.After(time.Millisecond * 100):
 		//rf.logger.Errorw("send RequestVote tiemout", "me", rf.me, "term", rf.term, "to", server)
 		return false
 	}
@@ -714,8 +887,25 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 	select {
 	case ok := <-finishC:
 		return ok
-	case <-time.After(time.Millisecond * 30):
-		//rf.logger.Errorw("send AppendEntries tiemout", "me", rf.me, "term", rf.term, "to", server, "args", args, "reply", reply)
+	case <-time.After(time.Millisecond * 100):
+		rf.logger.Errorw("send AppendEntries tiemout", "me", rf.me, "term", rf.term, "to", server, "args", args, "reply", reply)
+		return false
+	}
+}
+
+func (rf *Raft) sendSnapshot(server int, args SnapshotArgs, reply *SnapshotReply) bool {
+	rf.logger.Infow("send Snapshot request", "me", rf.me, "term", rf.term, "to", server, "args", args)
+
+	finishC := make(chan bool)
+	go func(chan bool) {
+		finishC <- rf.peers[server].Call("Raft.Snapshot", args, reply)
+	}(finishC)
+
+	select {
+	case ok := <-finishC:
+		return ok
+	case <-time.After(time.Millisecond * 100):
+		rf.logger.Errorw("send Snapshot timeout", "me", rf.me, "term", rf.term, "to", server, "args", args, "reply", reply)
 		return false
 	}
 }
@@ -735,20 +925,27 @@ func (rf *Raft) persist() {
 	if err := e.Encode(rf.voteFor); err != nil {
 		panic(err.Error())
 	}
-	if err := e.Encode(rf.applied); err != nil {
+	if err := e.Encode(rf.commit); err != nil {
 		panic(err.Error())
 	}
+	if err := e.Encode(rf.persisted); err != nil {
+		panic(err.Error())
+	}
+	if err := e.Encode(rf.lastIncludeIndex); err != nil {
+		panic(err.Error())
+	}
+	if err := e.Encode(rf.lastIncludeTerm); err != nil {
+		panic(err.Error())
+	}
+	rf.raftLog.Persist(e)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
-
-	// save snapshot
-	rf.persister.SaveSnapshot(rf.raftLog.Persist())
 }
 
 //
 // restore previously persisted state.
 //
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte, materFunc MaterializeFunc, deMaterFunc DeMaterializeFunc) {
 	// restore raft state
 	if data != nil {
 		r := bytes.NewBuffer(data)
@@ -759,13 +956,23 @@ func (rf *Raft) readPersist(data []byte) {
 		if err := d.Decode(&rf.voteFor); err != nil {
 			panic(err.Error())
 		}
-		if err := d.Decode(&rf.applied); err != nil {
+		if err := d.Decode(&rf.commit); err != nil {
 			panic(err.Error())
 		}
-	}
+		if err := d.Decode(&rf.persisted); err != nil {
+			panic(err.Error())
+		}
+		if err := d.Decode(&rf.lastIncludeIndex); err != nil {
+			panic(err.Error())
+		}
+		if err := d.Decode(&rf.lastIncludeTerm); err != nil {
+			panic(err.Error())
+		}
 
-	// restore snapshot
-	rf.raftLog = NewMemoryLog(rf.persister.ReadSnapshot())
+		rf.raftLog = NewMemoryLog(d, materFunc, deMaterFunc)
+	} else {
+		rf.raftLog = NewMemoryLog(nil, materFunc, deMaterFunc)
+	}
 }
 
 func min(a, b int) int {

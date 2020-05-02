@@ -1,16 +1,17 @@
 package raft
 
 import (
-	"bytes"
 	"encoding/gob"
 )
 
 type Entry struct {
-	Term int
-	Data interface{}
+	Index int
+	Term  int
+	Data  interface{}
 }
 
 type RaftLog interface {
+	FirstIndex() int
 	LastTerm() int
 	LastIndex() int
 	Match(logIndex, logTerm int) bool
@@ -21,24 +22,29 @@ type RaftLog interface {
 	Append(entries []*Entry)
 	GetMaxMatchIndex(term int) int
 	Catoff(index int)
-	Persist() []byte
+	Persist(e *gob.Encoder)
+	RemoveExpiredLogs(endIndex int)
 }
+
+type MaterializeFunc = func(encoder *gob.Encoder, command interface{}) error
+type DeMaterializeFunc = func(decoder *gob.Decoder) (interface{}, error)
 
 // MemoryLog is raft log in memory, not persistent to disk
 // entries[0] not use, log start at entries[1]
 type MemoryLog struct {
-	len     int // len is log length, equal len(entries) - 1
-	entries []*Entry
+	len               int
+	entries           []*Entry
+	materializeFunc   MaterializeFunc
+	deMaterializeFunc DeMaterializeFunc
 }
 
-func NewMemoryLog(content []byte) RaftLog {
+func NewMemoryLog(d *gob.Decoder, materFunc MaterializeFunc, deMaterFunc DeMaterializeFunc) RaftLog {
 	l := &MemoryLog{
-		entries: make([]*Entry, 0),
+		entries:           make([]*Entry, 0),
+		materializeFunc:   materFunc,
+		deMaterializeFunc: deMaterFunc,
 	}
-	if content != nil {
-		r := bytes.NewBuffer(content)
-		d := gob.NewDecoder(r)
-
+	if d != nil {
 		// decode log length
 		if err := d.Decode(&l.len); err != nil {
 			panic(err.Error())
@@ -46,19 +52,28 @@ func NewMemoryLog(content []byte) RaftLog {
 
 		// decode log one by one
 		for i := 0; i < l.len; i++ {
-			var term int
-			var data int
-
+			var index, term int
+			if err := d.Decode(&index); err != nil {
+				panic(err)
+			}
 			if err := d.Decode(&term); err != nil {
-				panic(err.Error())
+				panic(err)
 			}
-			if err := d.Decode(&data); err != nil {
-				panic(err.Error())
+			command, err := deMaterFunc(d)
+			if err != nil {
+				panic(err)
 			}
-			l.entries = append(l.entries, &Entry{term, data})
+			l.entries = append(l.entries, &Entry{index, term, command})
 		}
 	}
 	return l
+}
+
+func (l *MemoryLog) FirstIndex() int {
+	if l.len == 0 {
+		return -1
+	}
+	return l.entries[0].Index
 }
 
 func (l *MemoryLog) LastTerm() int {
@@ -150,23 +165,26 @@ func (l *MemoryLog) Catoff(index int) {
 	l.len = len(l.entries)
 }
 
-func (l *MemoryLog) Persist() []byte {
-	w := new(bytes.Buffer)
-	e := gob.NewEncoder(w)
-
+func (l *MemoryLog) Persist(e *gob.Encoder) {
 	// write log len
 	if err := e.Encode(l.len); err != nil {
 		panic(err.Error())
 	}
 	// write log one by one
 	for i := 0; i < l.len; i++ {
+		if err := e.Encode(l.entries[i].Index); err != nil {
+			panic(err.Error())
+		}
 		if err := e.Encode(l.entries[i].Term); err != nil {
 			panic(err.Error())
 		}
-		if err := e.Encode(l.entries[i].Data); err != nil {
-			panic(err.Error())
+		if err := l.materializeFunc(e, l.entries[i].Data); err != nil {
+			panic(err)
 		}
 	}
+}
 
-	return w.Bytes()
+func (l *MemoryLog) RemoveExpiredLogs(endIndex int) {
+	l.entries = l.entries[endIndex+1 : len(l.entries)]
+	l.len = len(l.entries)
 }

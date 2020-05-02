@@ -1,13 +1,20 @@
 package raftkv
 
-import "labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
 
+	uuid2 "github.com/satori/go.uuid"
+
+	"go.uber.org/zap"
+
+	"github.com/singlemonad/mit6.824/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	logger  *zap.SugaredLogger
 }
 
 func nrand() int64 {
@@ -20,7 +27,8 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+	logger, _ := zap.NewProduction()
+	ck.logger = logger.Sugar()
 	return ck
 }
 
@@ -37,8 +45,24 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
-	// You will have to modify this function.
+	for i := 0; i < 1000; i++ {
+		for id, _ := range ck.servers {
+			args := &GetArgs{key}
+			reply := &GetReply{}
+			if ok := ck.servers[id].Call("RaftKV.Get", args, reply); ok {
+				if !reply.WrongLeader {
+					if reply.Err == OK {
+						return reply.Value
+					} else {
+						ck.logger.Errorw("Get failed", "key", key)
+						return ""
+					}
+				}
+			}
+		}
+		<-time.After(time.Millisecond * 10)
+	}
+	ck.logger.Errorw("no leader exist", "key", key)
 	return ""
 }
 
@@ -53,7 +77,20 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	uuid := uuid2.NewV4().String()
+	for i := 0; i < 1000; i++ {
+		for id, _ := range ck.servers {
+			args := &PutAppendArgs{uuid, key, value, op}
+			reply := &PutAppendReply{}
+			if ok := ck.servers[id].Call("RaftKV.PutAppend", args, reply); ok {
+				if !reply.WrongLeader {
+					return
+				}
+			}
+		}
+		<-time.After(time.Millisecond * 10)
+	}
+	ck.logger.Errorw("no leader exist", "key", key, "value", value, "op", op)
 }
 
 func (ck *Clerk) Put(key string, value string) {

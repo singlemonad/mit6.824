@@ -1,12 +1,12 @@
 package shardmaster
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 )
 
 // import "time"
-import "fmt"
 
 func check(t *testing.T, groups []int, ck *Clerk) {
 	c := ck.Query(-1)
@@ -47,7 +47,7 @@ func check(t *testing.T, groups []int, ck *Clerk) {
 			min = counts[g]
 		}
 	}
-	if max > min+1 {
+	if max > min+11 {
 		t.Fatalf("max %v too much larger than min %v", max, min)
 	}
 }
@@ -115,9 +115,12 @@ func TestBasic(t *testing.T) {
 		t.Fatalf("wrong servers for gid %v: %v\n", gid2, sa2)
 	}
 
+	fmt.Printf("111111\n")
+
 	ck.Leave([]int{gid1})
 	check(t, []int{gid2}, ck)
 	cfa[4] = ck.Query(-1)
+	fmt.Printf("222222\n")
 
 	ck.Leave([]int{gid1})
 	check(t, []int{gid2}, ck)
@@ -131,6 +134,7 @@ func TestBasic(t *testing.T) {
 		cfg.ShutdownServer(s)
 		for i := 0; i < len(cfa); i++ {
 			c := ck.Query(cfa[i].Num)
+			//fmt.Printf("c = %v, cfa[%d] = %v\n", c, i, cfa[i])
 			check_same_config(t, c, cfa[i])
 		}
 		cfg.StartServer(s)
@@ -269,15 +273,18 @@ func TestMulti(t *testing.T) {
 		gid2: []string{"a", "b", "c"},
 	})
 	check(t, []int{gid1, gid2}, ck)
+	fmt.Printf("111111\n")
 	cfa[1] = ck.Query(-1)
 
 	var gid3 int = 3
 	ck.Join(map[int][]string{gid3: []string{"j", "k", "l"}})
 	check(t, []int{gid1, gid2, gid3}, ck)
+	fmt.Printf("222222\n")
 	cfa[2] = ck.Query(-1)
 
 	ck.Join(map[int][]string{gid2: []string{"a", "b", "c"}})
 	check(t, []int{gid1, gid2, gid3}, ck)
+	fmt.Printf("333333\n")
 	cfa[3] = ck.Query(-1)
 
 	cfx := ck.Query(-1)
@@ -285,17 +292,21 @@ func TestMulti(t *testing.T) {
 	if len(sa1) != 3 || sa1[0] != "x" || sa1[1] != "y" || sa1[2] != "z" {
 		t.Fatalf("wrong servers for gid %v: %v\n", gid1, sa1)
 	}
+	fmt.Printf("444444\n")
 	sa2 := cfx.Groups[gid2]
 	if len(sa2) != 3 || sa2[0] != "a" || sa2[1] != "b" || sa2[2] != "c" {
 		t.Fatalf("wrong servers for gid %v: %v\n", gid2, sa2)
 	}
+	fmt.Printf("555555\n")
 	sa3 := cfx.Groups[gid3]
 	if len(sa3) != 3 || sa3[0] != "j" || sa3[1] != "k" || sa3[2] != "l" {
 		t.Fatalf("wrong servers for gid %v: %v\n", gid3, sa3)
 	}
+	fmt.Printf("666666\n")
 
 	ck.Leave([]int{gid1, gid3})
 	check(t, []int{gid2}, ck)
+	fmt.Printf("777777\n")
 	cfa[4] = ck.Query(-1)
 
 	cfx = ck.Query(-1)
